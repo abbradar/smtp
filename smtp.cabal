@@ -34,6 +34,7 @@ library
                      , Arrows
                      , RecordWildCards
                      , TupleSections
+                     , ScopedTypeVariables
                      , TemplateHaskell
                      , RankNTypes
   hs-source-dirs:      src

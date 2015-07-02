@@ -5,16 +5,21 @@ module Network.SMTP.Protocol
          ReplyCode
        , getCode
        , SMTPReply(..)
+       , smtpReply
 
        , pattern CServiceReady
        , pattern CServiceClose
        , pattern CComplete
+       , pattern CStartInput
        , pattern CCmdSyntax
        , pattern CArgSyntax
        , pattern CBadSequence
 
        , buildReply
        , parseReply
+
+       , buildData
+       , parseData
 
        -- * Requests
        , Domain
@@ -39,9 +44,12 @@ import Control.Monad
 import Data.List (stripPrefix)
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as BL
-import qualified Data.ByteString.Builder as BL
-import Data.Text.Encoding (decodeUtf8', encodeUtf8)
-import Data.Text.Encoding.Error (UnicodeException(..))
+import qualified Data.ByteString.Lazy.Builder as BL
+import qualified Data.Text as T
+import qualified Data.Text.Lazy.Builder as TB
+import qualified Data.Text.Lazy.Builder.Int as TB
+import qualified Data.Text.Lazy as TL
+import Data.Text.Encoding (decodeUtf8, decodeUtf8')
 import qualified Data.Attoparsec.ByteString.Char8 as AP
 import Data.Attoparsec.Text
 import Network.SMTP.Address (EmailAddress, address)
@@ -52,37 +60,53 @@ newtype ReplyCode = ReplyCode { getCode :: Int }
                   deriving (Show, Eq)
 
 data SMTPReply = SMTPReply { replyCode :: !ReplyCode
-                           , replyMsg :: !B.ByteString
+                           , replyMsg :: !T.Text
                            }
                deriving (Show, Eq)
+
+smtpReply :: ReplyCode -> String -> SMTPReply
+smtpReply code str = SMTPReply code (T.pack str)
 
 pattern CServiceReady = ReplyCode 220
 pattern CServiceClose = ReplyCode 221
 pattern CComplete = ReplyCode 250
+pattern CStartInput = ReplyCode 354
 pattern CCmdSyntax = ReplyCode 500
 pattern CArgSyntax = ReplyCode 501
 pattern CBadSequence = ReplyCode 503
 
+line :: AP.Parser B.ByteString
+line = do
+  r <- AP.takeTill (== '\r')
+  _ <- AP.string "\r\n"
+  return r
+
+parseUtf8 :: B.ByteString -> AP.Parser T.Text
+parseUtf8 str = case decodeUtf8' str of
+  Left _ -> fail "Invalid text encoding"
+  Right res -> return res
+
 -- | Output a reply. Multiline replies are handled according to RFC 821, Appendix E.
-buildReply :: SMTPReply -> BL.Builder
+buildReply :: SMTPReply -> TL.Text
 buildReply (SMTPReply (ReplyCode code) str)
-  | code >= 100 && code < 1000 = br str
+  | code >= 100 && code < 1000 = TB.toLazyText $ br str
   | otherwise = error "buildReply: invalid reply code"
-  where br (B.break (== '\n') -> (curr, next))
-          | B.null next = BL.intDec code <> BL.char8 ' ' <> BL.byteString curr <> BL.byteString "\r\n"
-          | otherwise = BL.intDec code <> BL.char8 '-' <> BL.byteString curr <> BL.byteString "\r\n" <> br (B.tail next)
+  where br (T.break (== '\n') -> (curr, next))
+          | T.null next = TB.decimal code <> " " <> TB.fromText curr <> "\r\n"
+          | otherwise = TB.decimal code <> "-" <> TB.fromText curr <> "\r\n" <> br (T.tail next)
 
 -- | Parse reply string, including <CRLF>. Multiline replies are handled accordingly.
 parseReply :: AP.Parser SMTPReply
 parseReply = do
   code <- ReplyCode <$> AP.decimal
   c <- AP.satisfy $ AP.inClass " -"
-  msg <- AP.takeTill (== '\r') <* AP.string "\r\n"
+  msg <- line >>= parseUtf8
   if c == ' '
     then return $ SMTPReply code msg
     else do
       SMTPReply code' msg' <- parseReply
       when (code /= code') $ fail "Error codes in multiline reply differ"
+
       return $ SMTPReply code (msg <> "\n" <> msg')
 
 data RcptAddress = Postmaster
@@ -93,45 +117,24 @@ data SMTPCommand = Helo !Domain
                  | Ehlo !Domain
                  | MailFrom !(Maybe EmailAddress)
                  | RcptTo !RcptAddress
-                 | Data !BL.ByteString
+                 | Data
                  | Rset
                  | Noop
                  | Quit
                  deriving (Show, Eq)
 
-buildData :: BL.ByteString -> BL.Builder
-buildData "" = "."
-buildData (BL.break (== '\n') -> (curr, next)) = res <> BL.byteString "\r\n" <> buildData (BL.drop 1 next)
-  where res = case BL.uncons curr of
-          Just ('.', str) -> BL.byteString ".." <> BL.lazyByteString str
-          _ -> BL.lazyByteString curr
-
-buildCommand :: SMTPCommand -> BL.Builder
-buildCommand = (<> "\r\n") . bc
-  where bc (Helo dom) = BL.byteString "HELO " <> enc dom
-        bc (Ehlo dom) = BL.byteString "EHLO " <> enc dom
-        bc (MailFrom adr) = BL.byteString "MAIL FROM:<" <> maybe mempty (enc . E.toText) adr <> BL.char8 '>'
-        bc (RcptTo adr) = BL.byteString "RCPT TO:<" <> conv adr <> ">"
-          where conv Postmaster = BL.byteString "Postmaster"
-                conv (Rcpt a) = enc $ E.toText a
-        bc (Data dat) = BL.byteString "DATA\r\n" <> buildData dat
-        bc Rset = BL.byteString "RSET"
-        bc Noop = BL.byteString "NOOP"
-        bc Quit = BL.byteString "QUIT"
-
-        enc = BL.byteString . encodeUtf8
-
-parseUtf8 :: Parser a -> B.ByteString -> AP.Parser a
-parseUtf8 p s = do
-  t <- case decodeUtf8' s of
-    Left (DecodeError e _) -> fail e
-    Left (EncodeError _ _) -> error "parseUtf8: can't receive EncodeError"
-    Right r -> return r
-  case feed (parse (p <* endOfInput) t) "" of
-    Fail _ ctx e -> let e' = fromMaybe e (stripPrefix "Failed reading: " e)
-                   in foldl (<?>) (fail e') ctx
-    Partial _ -> error "parseUtf8: impossible happened"
-    Done _ r -> return r
+buildCommand :: SMTPCommand -> TL.Text
+buildCommand = TB.toLazyText . (<> "\r\n") . bc
+  where bc (Helo dom) = "HELO " <> TB.fromText dom
+        bc (Ehlo dom) = "EHLO " <> TB.fromText dom
+        bc (MailFrom adr) = "MAIL FROM:<" <> maybe mempty (TB.fromText . E.toText) adr <> ">"
+        bc (RcptTo adr) = "RCPT TO:<" <> conv adr <> ">"
+          where conv Postmaster = "Postmaster"
+                conv (Rcpt a) = TB.fromText $ E.toText a
+        bc Data = "DATA"
+        bc Rset = "RSET"
+        bc Noop = "NOOP"
+        bc Quit = "QUIT"
 
 path :: Parser EmailAddress
 path = atDom *> address
@@ -147,56 +150,65 @@ forwardPath = do
     <|> Rcpt <$> path <* char '>'
   <?> "forward path"
 
-dataParse :: AP.Parser BL.Builder
-dataParse = dotted <|> undotted
-  where undotted = do
-          r <- BL.byteString <$> AP.takeTill (== '\r')
-          _ <- AP.string "\r\n"
-          n <- dataParse
-          return $ r <> BL.char8 '\n' <> n
+buildData :: BL.ByteString -> BL.ByteString
+buildData = BL.toLazyByteString . build
+  where build "" = "."
+        build (BL.break (== '\n') -> (curr, next)) = res <> BL.byteString "\r\n" <> build (BL.drop 1 next)
+          where res = case BL.uncons curr of
+                  Just ('.', str) -> BL.byteString ".." <> BL.lazyByteString str
+                  _ -> BL.lazyByteString curr
+
+parseData :: AP.Parser BL.ByteString
+parseData = BL.toLazyByteString <$> dataline
+  where dataline = dotted <|> undotted
+        undotted = do
+          r <- BL.byteString <$> line
+          n <- dataline
+          return $ r <> "\r\n" <> n
         dotted = do
           _ <- AP.char '.'
           mempty <$ AP.string "\r\n"
             <|> undotted
 
 -- Returns parser that should be ran right after a command to produce the final output.
-textCommand :: Parser (AP.Parser SMTPCommand)
-textCommand = do
+parseCommandU :: Parser SMTPCommand
+parseCommandU = do
   cmd <- takeTill (== ' ')
   case cmd of
-    "HELO" -> argPure $ Helo <$> domain <|> fail "Domain expected"
-    "EHLO" -> argPure $ Ehlo <$> domain <|> fail "Domain expected"
-    "MAIL" -> argPure $ MailFrom <$> (string "FROM:" >> reversePath) <|> fail "Reverse path expected"
-    "RCPT" -> argPure $ RcptTo <$> (string "TO:" >> forwardPath) <|> fail "Forward path expected"
-    "DATA" -> stoparg >> return (Data <$> BL.toLazyByteString <$> dataParse <|> fail "Data expected")
-    "RSET" -> noargPure Rset
-    "NOOP" -> noargPure Noop
-    "QUIT" -> noargPure Quit
+    "HELO" -> arg $ Helo <$> domain <|> fail "Domain expected"
+    "EHLO" -> arg $ Ehlo <$> domain <|> fail "Domain expected"
+    "MAIL" -> arg $ MailFrom <$> (string "FROM:" >> reversePath) <|> fail "Reverse path expected"
+    "RCPT" -> arg $ RcptTo <$> (string "TO:" >> forwardPath) <|> fail "Forward path expected"
+    "DATA" -> noarg Data
+    "RSET" -> noarg Rset
+    "NOOP" -> noarg Noop
+    "QUIT" -> noarg Quit
     _ -> fail "Command not recognized"
 
-  where argPure p = (char ' ' <|> fail "Argument expected") *> (return <$> p) <* stoparg <?> "argument"
-        noargPure r = (return (return r)) <* stoparg <?> "argument"
+  where arg p = (char ' ' <|> fail "Argument expected") *> p <* stoparg <?> "argument"
+        noarg r = (return r) <* stoparg <?> "argument"
         stoparg = endOfInput <|> fail "No more arguments expected"
 
--- | Parse an SMTP command with the following CRLF.
--- | In the case of an error, if "argument" is in contexts, error 501 must be used instead of error 500.
--- | DATA is parsed accordingly.
+runParser :: Parser a -> T.Text -> AP.Parser a
+runParser parser str = check $ parse (parser <* endOfInput) str
+  where check (Fail _ ctx err) = let err' = fromMaybe err (stripPrefix "Failed reading: " err)
+                                 in foldr (flip (<?>)) (fail err) ctx
+        check (Partial cont') = check $ cont' ""
+        check (Done _ r) = return r
+
 parseCommand :: AP.Parser SMTPCommand
-parseCommand = do
-  cmd <- AP.takeTill (== '\r')
-  r <- parseUtf8 textCommand cmd
-  _ <- AP.string "\r\n" <|> fail "CRLF expected"
-  r
+parseCommand = line >>= parseUtf8 >>= runParser parseCommandU
 
 type Extension = B.ByteString
-type Description = Maybe B.ByteString
+type Description = Maybe T.Text
 
 data EhloReply = EhloReply !Domain !Description ![(Extension, Description)]
                deriving (Show, Eq)
 
-buildEhloReply :: EhloReply -> B.ByteString
-buildEhloReply (EhloReply dom greet exts) = encodeUtf8 dom <> maybe "" (" " <>) greet <> mconcat (map conv exts)
-  where conv (ext, desc) = "\n" <> ext <> maybe "" (" " <>) desc
+buildEhloReply :: EhloReply -> T.Text
+buildEhloReply (EhloReply dom greet exts) = dom <> maybeConv greet <> mconcat (map conv exts)
+  where conv (ext, desc) = "\n" <> decodeUtf8 ext <> maybeConv desc
+        maybeConv = maybe "" ((" " <>))
 
 parseEhloReply :: AP.Parser EhloReply
 parseEhloReply = EhloReply
@@ -208,7 +220,7 @@ parseEhloReply = EhloReply
                            <*> desc
                           )
   where desc = optional (AP.char ' ') >>= maybe (return Nothing) (const $ Just <$> ehloParam)
-        ehloDomain = AP.takeTill (AP.inClass " \n") >>= parseUtf8 domain
-        ehloParam = AP.takeWhile $ AP.inClass "\33-\126"
+        ehloDomain = AP.takeTill (AP.inClass " \n") >>= parseUtf8 >>= runParser domain
+        ehloParam = line >>= parseUtf8
         ehloKeyword = B.cons <$> AP.satisfy alphaNum <*> AP.takeWhile (\x -> alphaNum x || x == '-')
         alphaNum x = AP.isAlpha_ascii x || AP.isDigit x
