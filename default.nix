@@ -10,5 +10,6 @@ mkDerivation {
     attoparsec base bytestring conduit conduit-extra netwire network
     text transformers vector
   ];
+  doHaddock = false;
   license = stdenv.lib.licenses.bsd3;
 }
